@@ -224,7 +224,7 @@ C 不允许两个不同的匿名结构体共用同一个 typedef 名，所以"�
 | 单元 | 符号数 | 行数 | 状态 |
 | --- | --- | --- | --- |
 | `middleware/soc/common/hal/uart_hal.c` | 10 | 156 | ✅ 已替换 |
-| `middleware/driver/uart/uart_driver.c` | 57 | 1754 | 待做（契约表已建，见下） |
+| `middleware/driver/uart/uart_driver.c` | 57 | 1754 | ✅ 已替换（见下） |
 
 ### 分层
 
@@ -363,3 +363,467 @@ BK_LOGx → bk_printf_ext（我们的）→ 组同样的前缀 → syslog()
   GCC 把唯一调用优化掉后符号被收集；基线里它活着只是因为那次调用跨 TU、编译器无法判定。
   不为一个 map 条目添加假的副作用。
 - 待上板：日志仍按要求格式出现、控制台正常。
+
+### uart_driver 移植工作表（源码已通读，实现未开始）
+
+**本构建实际编译的部分**（用于估算工作量，**不是裁剪依据**）：`CONFIG_UART_RX_DMA` / `TX_DMA` 未定义 ⇒
+DMA 路径不编译；`CONFIG_UART_PM_CB_SUPPORT` 未定义 ⇒ `pm_backup/restore` 是两个 `return BK_OK`；
+`CONFIG_UART0_FLOW_CTRL` 未定义 ⇒ `uart_init_gpio` 的流控分支不编译；`CFG_CLI_DEBUG` 未定义；
+`CONFIG_SPE=1` ⇒ `UART_CHECK_SECURE()`（`DEV_IS_SECURE()` 断言）保留。
+
+**但实现必须 follow 配置，不按当前配置裁剪。** 权威里的 `#if CONFIG_UART_RX_DMA` / `CONFIG_UART_TX_DMA` /
+`CONFIG_UART_PM_CB_SUPPORT` / `CONFIG_UART0_FLOW_CTRL` / `CFG_CLI_DEBUG` 分支要**原样保留**（连同 DMA 辅助函数、
+`uart_id_to_dma_dev`、`uart_rx_dma_read_fifo_frame` 等），当前不编译只是当前配置的结果。
+理由与 `bk7258_wdt.c` 保留 `CONFIG_INT_AON_WDT` 段、`bk7258_printf.c` 保留
+`CONFIG_SYS_PRINT_DEV_MAILBOX` 分支一致：打开某个配置组合时不能撞到"缺实现"。
+按当前配置裁剪等于把契约面从 57 个符号扩成"57 个符号 + 若干配置组合"，属于隐藏的契约退让。
+
+**镜像里真正是活的只有 7 个符号**（`nuttx.map` 实测）：`bk_uart_driver_init`、`uart_id_to_pm_uart_id`、
+`bk_uart_pm_backup/restore`（空壳）、`bk_uart_get_rx_gpio`、`bk_uart_get_ate_detect_gpio`、`uart_wait_tx_over`。
+其余 50 个当前没有引用者（Armino CLI 已被我们的 compat shell 切掉输入，日志已改走 syslog）。
+验收基线因此是：**替换后镜像里仍是同样的 7 个符号**。
+
+**状态结构**（照抄）：
+- `uart_driver_t { uart_hal_t hal; uint8_t id_init_bits; uint8_t id_sw_fifo_enable_bits;
+  uint32_t pm_backup[UART_PM_BACKUP_REG_NUM]; uint8_t pm_bakeup_is_valid;
+  bool rx_dma_enable; dma_id_t rx_dma_id; bool tx_dma_enable; dma_id_t tx_dma_id; }`
+- `s_uart[SOC_UART_ID_NUM_PER_UNIT]`（`hal.hw` 分别指向 `SOC_UART0/1/2_REG_BASE`）
+- `s_uart_rx_isr[] / s_uart_tx_isr[]`（`{callback, param}`）、`s_uart_rx_kfifo[]`、`s_uart_sema[]`（`{rx_blocked, rx_int_sema}`）
+- `s_last_uart_rx_isr`（`take/recover` 用）
+
+**分片与依赖**：
+
+| 片 | 内容 | 依赖 |
+| --- | --- | --- |
+| 1 | `uart_clock_enable/disable`、`uart_interrupt_enable/disable`、`uart_init_gpio`、`uart_deinit_{tx,rx}_gpio` | `sys_drv_dev_clk_pwr_up`、`sys_drv_int_enable/disable`、`gpio_dev_map/unmap`、`bk_gpio_pull_up` |
+| 2 | `uart_id_init_kfifo`、`uart_id_{init,deinit}_common`、`bk_uart_init/deinit`、`driver_init/deinit` | `kfifo_alloc/free`、`uart_statis_*`、`rtos_init/deinit_semaphore`、`bk_pm_sleep_register_cb` |
+| 3 | 配置组：baud/data_bits/stop_bits/parity/enable_rx/tx/threshold/rx_timeout/flow_ctrl | `uart_hal_set_*`、`clk_get_uart_clk` |
+| 4 | 读写组：`uart_write_byte/string/ready`、`bk_uart_write/read_bytes`、`read_byte(_ex)`、`get_length_in_buffer`、`wait_tx_over`、`is_tx_over` | `uart_hal_*`、`kfifo_*`、`rtos_get/set_semaphore` |
+| 5 | 中断组：`register/take/recover_{rx,tx}_isr`、`uart_isr_common`、`uart0/1/2_isr`、`uart_get/clear_interrupt_status`、`isr_register_functions` | `bk_int_isr_register(INT_SRC_UARTn)`、`UART_STATIS_*` |
+| 6 | 旁路：`enable/disable_sw_fifo`、`get_ate_detect_gpio`、`get_rx_gpio`、`write_byte_for_ate/for_fr`、`print_hex_dump`、`is_in_used`、`is_rx_dma_enabled`、`pm_backup/restore` 空壳、`uart_id_to_pm_uart_id` | 无 |
+
+**必须照抄的行为**（容易漏）：
+1. `uart_write_byte()` 先等 `fifo_write_ready` 再写；
+2. `uart_write_string()` 在 `\n` 前补 `\r`（除非前一个已经是 `\r`）；
+3. `uart_read_fifo_frame()` 在 kfifo 满时**仍然继续读空硬件 FIFO**（否则死循环），只是不 put；
+4. `bk_uart_read_bytes()` 两条路：软件 FIFO 打开 → kfifo + 信号量等待（`rx_blocked` 门控、超时返回
+   `BK_ERR_UART_RX_TIMEOUT`）；未打开 → 直接轮询 `uart_read_byte_ex()`；
+5. `bk_uart_take_rx_isr()` 会先关软 FIFO、再换回调；`recover` 时若 `id == bk_get_printf_port()` 则不重新打开软 FIFO；
+6. `bk_uart_wait_tx_over()` 用 `tx_fifo_count + 1` 与 `UART_CLOCK/(clk_div+1)` 估算等待微秒，再 `bk_delay_us()`；
+7. `bk_uart_init()` 的顺序：关 TX 中断 → 清状态 → 注册 ISR → `uart_hal_init` → 中断使能 → 时钟/GPIO/kfifo/sema →
+   选时钟源 → `uart_hal_init_uart` → `uart_hal_start_common`；并且**已初始化就直接返回 OK**；
+8. `bk_uart_deinit()` 逆序：`uart_id_deinit_common`（停 HAL、复位配置、关中断/时钟、释放 kfifo 与信号量）。
+
+**实现顺序**：1→2→3→4→5→6，每片写完单独编译（不接线），57 个齐了再一次性 exclude `uart_driver.c`。
+
+### uart_driver 的实现记录
+
+落在 `chips/bk7258/bk7258_uart_driver.c`（1942 行，含全部 `#if` 分支）。**57/57 导出符号，与权威逐条相同**；
+`uart_driver.c.o` 在 map 里计数 0。
+
+所有配置分支照抄：`CONFIG_UART_RX_DMA` / `CONFIG_UART_TX_DMA` 的 DMA 全套、`CONFIG_UART_PM_CB_SUPPORT` 的真实
+backup/restore、`CONFIG_UART0_FLOW_CTRL` 的 CTS/RTS 复用、`CFG_CLI_DEBUG`、`CONFIG_SPE` 的
+`UART_CHECK_SECURE()`。当前配置下 DMA/PM 分支不参与编译，但代码在。
+
+**镜像里仍然是同样的 7 个活符号**（与替换前一致）：
+
+```
+bk_uart_driver_init  bk_uart_get_ate_detect_gpio  bk_uart_get_rx_gpio
+bk_uart_pm_backup    bk_uart_pm_restore           uart_id_to_pm_uart_id
+uart_wait_tx_over
+```
+
+**13 个符号从镜像里消失，原因是日志批的连带效应，不是丢失**：`bk_uart_init/deinit` 在基线里唯一的调用者是
+`printf_base.c` 的 `bk_printf_init()`（它会 `bk_uart_init(print_port, &cfg)` 重新配置 UART0）。
+日志改走 syslog 后我们特意不再从日志层初始化 UART，这条链就断了，于是
+`uart_enter_deep_sleep`（它调 `bk_uart_set_enable_rx/tx`、`bk_uart_disable_tx_interrupt`）、
+`uart_isr_register_functions`（它引用 `uart0/1/2_isr`）、以及 `uart_write_byte/string`、
+`uart_read_byte_ex`、`uart_clock_enable/disable` 一起失去引用。**导出集合完整**，这些路径当前不可达。
+
+顺带确认 `uart_wait_tx_over` 不依赖被 gc 的初始化：`uart_hal_wait_tx_over()` 是
+`uart_ll_wait_tx_over()` 的宏，内部直接读 UART0/1/2 的寄存器，不用 `s_uart[]` 的状态。
+
+验收：`nm -u` 0；静态 SRAM 287,136 B（未变）；WDT 批 43 符号零差异。
+
+---
+
+## 批次 6：移除 Armino CLI 与触摸驱动（不是替换，是删除）
+
+### 为什么删
+
+`components/bk_cli` 从 shell_uart 被替换后就**没有输入设备**了：它照样在启动时被
+`bk_init.c:210/214` 初始化、注册一整张命令表、拉进二十来个 `cli_*.c`，但没有人能敲命令进去。
+日志改走 syslog 之后，它连"异步日志出口"这个唯一实际作用也没了。
+
+### 排除它需要补的 7 个符号
+
+删 `bk_cli` 后链接器一次列全了缺口（`shell_assert_out` 114 次、`shell_log_flush` 107 次、
+`shell_cmd_ind_out` 10 次、`shell_set_log_cpu` 6 次、`shell_set_uart_port`/`shell_set_log_level`/
+`bk_cli_init` 各 1 次），由 `compat/bk7258_armino_shell_api.c` 提供：
+
+| 符号 | 我们的实现 |
+| --- | --- |
+| `shell_log_flush()` | 空操作 —— 日志已同步写 syslog，没有环形缓冲要 flush |
+| `shell_assert_out()` | **不是空操作**：走 `up_putc()` 直写控制台（等价于权威的 `emergency_uart_write_buf`），`bContinue == false` 时保持"停在这里" |
+| `shell_cmd_ind_out()` / `shell_set_log_cpu()` | 空操作（没有 CLI 提示符、没有日志归属核） |
+| `shell_set_uart_port()` | 转发 `bk_set_printf_port()`，与权威一致 |
+| `shell_set_log_level()` | 存值；现在没有代码按它过滤 |
+| `bk_cli_init()` | 返回 0（kNoErr） |
+
+`at_server` **必须保留**：`bk_init.c:275/333` 在启动时调 `at_server_init()`/`atsvr_app_init()`，
+它的命令设备是 `shell_uart`（由 `compat/bk7258_armino_shell.c` 提供）。曾经尝试连 `at_server` 一起排除，
+链接器立刻要 `at_server_init`、`atsvr_app_init`、`at_svr_env` 等 8 个符号，所以它不是叶子。
+
+### 连带收益：触摸驱动可以整体删除
+
+`touch_driver_v1_1` 唯一的引用者是 `cli_pwr.c` 的 `bk_touch_register_touch_isr`。`bk_cli` 一走，
+这个引用消失，整个触摸控制器驱动（438 行、25 符号）随之可以排除——**不需要移植**，因为这块板子
+从不驱动触摸面板。
+
+### 实测影响
+
+| 指标 | 清理前 | 清理后 | 变化 |
+| --- | --- | --- | --- |
+| 镜像符号数 | 8,210 | 7,756 | **−454** |
+| 静态 SRAM | 287,112 B | 276,704 B | **−10,408 B** |
+| `.text` | ~1,060 KB | 1,003,324 B | **−~57 KB** |
+| `libarmino_bk_cli` 成员 | 10 | 0 | 全出局 |
+| `touch_driver_v1_1` 成员 | 1 | 0 | 出局 |
+| `nm -u` | 0 | 0 | — |
+| 43 个 WDT/reset 符号面 | — | — | 零差异 |
+
+### 验收状态（已上板）
+
+镜像 `232d99a0…`（`all-app.bin`，源码 mtime 早于打包时间），CP `nsh>` 实测：
+
+| 检查项 | 结果 |
+| --- | --- |
+| 启动日志格式 | `cpu0:tag:LEVEL(ms):` 保持，毫秒时间戳正确 |
+| 关联流程 | `wapi psk` / `wapi essid` → scan → assoc → 4-way → DHCP 全通 |
+| 地址 | `[ARMINO] wlan0 ip 192.168.110.166` |
+| 外网 | `ping www.baidu.com` 4/4，26–48 ms |
+| `nm -u` | 0 |
+| `libarmino_bk_cli.a` 成员 | 0 |
+| 静态 SRAM | 266,624 B |
+
+**唯一有意改变的一行日志**：`cpu0:cli:I(...):BK STA got ip4` 不再出现。它由被删的
+`cli_netif.c` 打印，是 CLI 的回调，不是协议栈的输出；DHCP 本身由
+`[ARMINO] wlan0 ip …` 与 `[KW:]me dhcp done vif:0` 证明。
+
+### 为什么"符号少了 454 个"不等于风险
+
+判断顺序必须是结构性的，不是计数：
+
+1. **穷举**：静态链接 + `--gc-sections` 下，任何被保留的代码引用被删符号都会在链接期报
+   `undefined reference`。链接通过且 `nm -u` 为 0 ⇒ 没有幸存代码依赖它们。
+2. **反向**：被删的东西在运行时原本做什么。`bk_cli_init()` 承担三件事 —— 注册命令表
+   （无输入设备）、创建 `shell_task` 线程（消费 shell UART 输入 + 异步日志环）、
+   `create_log_handle_task()` 创建 `log_hanlder` 线程（排空同一个环）。日志改 syslog 后
+   环没有生产者，后两件事的消费者已无对象。
+3. **残留引用逐条核**：`shell_log_out_port` 的唯一引用在 `platform_stub.c.o`（该段被 gc）；
+   `create_log_handle_task` 只在被排除的归档内部；`shell_log_flush` 真正的活调用者是
+   `at_server`，已给 no-op。**符号总数不能当判据**，它随 gc 两个方向都动。
+
+---
+
+## 批次 7：`stack_base` + `dd`（5 个符号，零活符号）
+
+两个都是"读导出集合就知道规模"的小单元，一起做是因为彼此无关、风险都接近零。
+
+### `stack_base.c` → `chips/bk7258/bk7258_stack_base.c`（3 符号）
+
+`code_addr_is_valid` / `stack_mem_dump` / `arch_parse_stack_backtrace`，**镜像里 0 个活的**。
+它们是异常 dump 的**读半边**；写半边（`arch_is_enter_exception`、`bk_system_dump`、dump hook）
+仍在 `trap_base.c` 里，那是后续批次。
+
+保留的分支：`stack_mem_dump` 里的 `#if CONFIG_DEBUG_VERSION || CONFIG_DUMP_ENABLE`（打印过程中
+喂 WDT：`bk_task_wdt_feed()` / 异常态下 `bk_wdt_force_feed()`）。当前两个宏都未定义，该分支不参与
+编译，但代码在。`code_addr_is_valid` 的判定是"奇数地址 + 在 flash text / ITCM / IRAM 内"，权威里
+还有一版更严格的（要求前一条指令是 bl/blx）已被注释掉，照原样保留。
+
+构建期需要一处新 include：`<driver/flash_partition.h>` → `partitions.h` → 生成的
+`CONFIG_APPLICATION_PARTITION_OFFSET`，所以 chip 目标的 include 列表加了
+`middleware/boards/bk7258/partitions` 与 `build/bk7258/iperf/partitions` 两个目录。
+
+### `dd.c` → `chips/bk7258/bk7258_dd.c`（2 符号）
+
+`g_dd_init` / `g_dd_exit`，**这张表在当前配置下是空的**，而且这是忠实而不是遗漏：
+`CONFIG_SOC_BK7236XX` 已定义 ⇒ 选小表；小表唯一的条目又要 `CONFIG_FLASH_ORIGIN_API`，它未定义。
+于是 `sizeof(dd_init_tbl) == 0`，循环计数 0，两个函数立刻返回。镜像里只有 `g_dd_init` 是活的
+（`driver.c:312` 调用）。
+
+大表的九个分支（sctrl / flash-origin / DSP / mailbox / BT / FFT / IrDA / MAC-PHY-bypass / SD 卡）
+全部保留，每个分支连同它需要的头文件一起走同一个 `#if`，配置一翻就落到完整表而不是空表。
+
+### 验收
+
+| 项 | 结果 |
+| --- | --- |
+| 导出符号 | **5 / 5**，与权威逐条相同 |
+| 机器码 | **5 个函数逐字节相同**（14 / 29 / 38 / 16 / 15 条指令） |
+| `stack_base.c.o` / `dd.c.o` 在 map | 均 **0** |
+| 镜像内活符号 | `g_dd_init` 仍在（与替换前的 1 个一致），其余 4 个仍被 gc |
+| `nm -u` | 0 |
+| 静态 SRAM | 266,624 B（**未变**） |
+| `.text` | 1,003,324 → 1,003,332 B（+8，对齐） |
+
+---
+
+## 批次 8：`driver`（启动编排，2 个符号）
+
+`middleware/driver/common/driver.c` → `chips/bk7258/bk7258_driver.c`。
+
+`driver_early_init()`（中断控制器 / AON PMU / TRNG / eFuse）与 `driver_init()`（全部驱动初始化）都在
+启动路径上，**两个都是活符号**。这个单元没有逻辑，只有顺序，所以移植的唯一要求就是顺序与门控完全
+一致：GPIO 先于 ATE（ATE 借用 UART TX 脚做检测）与 UART；UART 起来之前不许打日志；mailbox 的
+`ipc_init` → `mb_ipc_init` → `bk_ipc_init` 三步；PSRAM 在最后（这条是本仓库对基线做过的唯一本地改动，
+注释一并保留）。
+
+配置门控的实际取值：`CONFIG_POWER_CLOCK_RF` **未定义** ⇒ 150 行的 `power_clk_rf_init()` 整段不编译
+（函数保留在同一个 `#if` 里，连同一个非 `static` 链接属性）；`CONFIG_CHIP_SUPPORT`、`CONFIG_SPI`、
+`CONFIG_I2C`、`CONFIG_QSPI`、`CONFIG_SDIO_HOST`、`CONFIG_CALENDAR`、`CONFIG_TOUCH_PM_SUPPORT`、
+`CONFIG_HW_ROTATE_PFC`、`CONFIG_LIN`、`CONFIG_TRUSTENGINE` 均未定义。
+
+两处构建层面的注意：
+
+- **`CONFIG_SPI` 同名冲突由本文件自己处理**。NuttX 的 `<nuttx/config.h>` 定义 `CONFIG_SPI` 指它自己的
+  SPI 层，而 Armino 这个名字的意思是"Armino SPI 驱动被编译进来了"，它没有。基线单元靠
+  `compat/bk7258_armino_nuttx_config.h` 解决，chip 层 TU 只能自己 `#undef`。这也让
+  `nuttx_config_compat_components` 里的 `driver` 条目失去了意义，一并清空（列表本身保留，注释说明原因）。
+- **`bk_ipc_init()` 用本地 extern 声明，不引入 `bk_api_ipc.h`**。那个目录（`middleware/driver/mailbox`）
+  的兄弟头文件会与 `mb_ipc/armino/middleware/driver/mailbox/mailbox_driver_base.h` 重复定义
+  `MAILBOX0..3` 与整个 `mailbox_*_t` 家族——凡是这两个头文件家族进同一个 TU 就报 redeclaration。
+  签名取自 `bk_api_ipc.h:135`。
+
+新增 include 目录三个：`middleware/driver/common`（dd_pub.h / drv_model.h）、`components/easy_flash`
+与 `components/easy_flash/easy_flash_V4.X/inc`（`bk_ef.h` → `easyflash.h`）。
+
+### 验收
+
+| 项 | 结果 |
+| --- | --- |
+| 导出符号 | **2 / 2**（`driver_early_init`、`driver_init`） |
+| 机器码 | **两个函数逐字节相同**（22 B / 128 B） |
+| `driver.c.o` 在 map | **0** |
+| 镜像内 | 两个符号仍由 `arch/libarch.a(bk7258_driver.c.o)` 提供 |
+| `nm -u` | 0 |
+| `.text` / `.data` / `.bss` | 1,003,332 / 10,080 / 266,624 B —— **与批次 7 后完全相同** |
+
+批次 7 + 8 合并上板（镜像 `50ce970f…`）：
+
+| 检查项 | 结果 |
+| --- | --- |
+| `driver_init` 的 PSRAM 段 | `cpu0:I(138):driver_init: psram init ok` |
+| EasyFlash（`driver_init` 调用） | `cpu0:ef:I(98):EasyFlash V4.1.0 is initialize success.` |
+| Wi-Fi bring-up | `cpu0:wifi:I(431):wifi inited(1) ret(0)` |
+| AP 侧 | `[AP] stage=scheduler-running`、console attach、`nsh-ap>` 就绪 |
+| 日志格式 | `[ts] cpu0:tag:LEVEL(ms):` 不变 |
+| 堆起点 | `H28096CE8:00008A18`（0x8A18 = 35,352 B，较 CLI 批前 +10,424 B） |
+
+---
+
+## 批次 9：`drv_model`（设备模型，12 个符号）
+
+`middleware/driver/common/drv_model.c` → `chips/bk7258/bk7258_drv_model.c`。
+
+`DD_MAX_DEV` 个槽位的设备表（状态、引用计数、`DD_OPERATIONS *`）加上 open/close/read/write/control
+分发。句柄是"槽位号 + 高半字魔数 `0xA5A50000`"，所以每个入口都先验魔数与下标。临界区用权威的
+`GLOBAL_INT_DISABLE/RESTORE`（即 `rtos_disable_int()` / `rtos_enable_int()` 的保存-恢复对）——状态和
+引用计数的更新在同一次关中断里完成，ISR 与任务之间不会丢更新。
+
+`ddev_control()` 比其它入口多一道 `idx >= DD_MAX_DEV` 检查：它与 `ddev_get_id_from_handle()` 的
+`DD_DEV_TYPE_END` 上界重复，但类型值落在 `DD_DEV_TYPE_END` 与 `DD_MAX_DEV` 之间的设备会越界读表，
+所以照抄保留。
+
+活符号：`drv_model_init`、`ddev_get_id_from_handle`、`ddev_control`。
+
+### 编译期坑：第二个 `drv_model_pub.h`
+
+`wifi/hal_port/include/` 里有一份**精简副本**，没有 `DD_DEV_TYPE_END` 和 `DD_HANDLE_MAGIC_MASK` /
+`ID_MASK`；而 `drv_model.h` 的 `DD_MAX_DEV` 正是 `(DD_DEV_TYPE_END & 0xFFFF)`。arch 目标的 include 列表
+原本不含 `bk_private/legacy`，于是 `"drv_model_pub.h"` 解析到 hal_port 那份，编译报
+`DD_DEV_TYPE_END undeclared`。修法：把 `middleware/driver/include/bk_private/legacy` 加到 CP 块里，
+位置在 hal_port 之前。legacy 目录只有 5 个条目，与 hal_port 唯一同名的就是这一个头文件。
+
+（这是与 `temp_detect.h` 同一类的影子头问题：**先看第二份副本是谁，再改 include 顺序**。）
+
+### 验收
+
+| 项 | 结果 |
+| --- | --- |
+| 导出符号 | **12 / 12** |
+| 机器码 | **12 个函数逐字节相同**（4–144 B） |
+| 目标文件 | 权威 694 / 0 /364；我们 694 / 0 /364 —— 三段全同 |
+| `drv_model.c.o` 在 map | **0** |
+| `nm -u` | 0 |
+| `.text` / `.data` / `.bss` | 与批次 8 后完全相同 |
+
+---
+
+## 批次 10：`arm`（CM33 核面，9 个符号，94 行）
+
+`middleware/arch/cm33/arm.c` → `chips/bk7258/bk7258_arm.c`。
+
+`arch_init()` 与 `smem_reset_lastblock()` 在权威里就是**空函数**（2 字节 `bx lr`），照抄；`arch_init`
+之所以是活符号，是 `trap_base.c` 引用它。其余是核级原语：`arch_sleep`/`arch_deep_sleep`（WFI 加/清
+SLEEPDEEP，分别放在 `.iram` 与 `.itcm_sec_code` 段）、`check_IRQ_pending`（64 位挂起掩码）、
+`arch_atomic_{set,set_return,clear}` 与 `arch_fence`（LDREX/STREX、DSB/ISB）。
+
+**段属性照抄**，即使本 port 的 `flash.ld` 没有 ITCM 区：权威也是这么编的，去掉属性等于改变链接器
+放置这段代码的自由度。
+
+新增两个 CMSIS include 目录（`CMSIS_5/CMSIS/Core/Include`、
+`CMSIS_5/Device/Beken/armstar`）：`SCB`、`__LDAEX/__STREXW/__STL`、`NVIC_GetAllPendingIRQ` 都在那里，
+arch 目标原先不含 CMSIS。
+
+### 验收
+
+| 项 | 结果 |
+| --- | --- |
+| 导出符号 | **9 / 9** |
+| 机器码 | **9 个函数逐字节相同**（2–28 B） |
+| `arm.c.o` 在 map | **0** |
+| 镜像内 | `arch_init`(0x…a4) 与 `smem_reset_lastblock`(0x…a6) 相邻且各 2 字节 —— 与权威一致 |
+| `nm -u` | 0 |
+| `.text` | 1,003,332 → 1,003,340 B（+8，对齐） |
+
+---
+
+## 批次 11：`sys_audio_driver`（音频系统控制面，42 个符号）
+
+`middleware/driver/sys_ctrl/sys_audio_driver.c` → `chips/bk7258/bk7258_sys_audio_driver.c`。
+
+42 个函数，没有一个 `#if`，全是同一个三步形态：取 sysctrl 临界区 → 调一个 `sys_hal_*` 寄存器助手
+→ 释放 → `SYS_DRV_SUCCESS`。其中两个（`sys_drv_aud_select_clock`、`sys_drv_aud_clock_en`）在写寄存器
+前后用 `sys_amp_res_acquire()`/`release()` 包住，因为改音频时钟或 PLL 分频要占着模拟资源。
+
+活符号 3 个：`sys_drv_apll_en`、`sys_drv_aud_audbias_en`、`sys_drv_aud_aud_en`（音频设备注册路径）。
+`sys_hal_*` 助手本身未动。
+
+这一批的 42 个函数体是**机械重排**生成的（去掉制表符、改成 2 空格缩进、注释换成 NuttX 风格），而不是
+手抄——手抄 42 个四行函数只会引入笔误，而机器码比对会把任何笔误解释成"不同"。
+
+### 验收
+
+| 项 | 结果 |
+| --- | --- |
+| 导出符号 | **42 / 42**，集合差异为空 |
+| 机器码 | **42 个函数逐字节相同** |
+| `sys_audio_driver.c.o` 在 map | **0** |
+| 三个活符号 | 由 `arch/libarch.a(bk7258_sys_audio_driver.c.o)` 提供 |
+| `nm -u` | 0 |
+| `.text` | 1,003,340 → 1,003,348 B |
+
+批次 9–11 合并上板（镜像 `383fb680…`）：启动序列与批次 7/8 逐行一致（`psram init ok`、`EasyFlash success`、
+`wifi inited(1) ret(0)`、AP `scheduler-running`），`wapi` 关联 → DHCP `192.168.110.166`，
+`ping www.baidu.com` **10/10，21–38 ms**。CLI 批之后 `BK STA got ip4` 那一行不再出现，与此前记录一致。
+
+---
+
+## 批次 12：`trap_base`（异常与 dump 核心，22 个符号，864 行）
+
+`middleware/arch/cm33/trap_base.c` → `chips/bk7258/bk7258_trap_base.c`。
+
+这个单元只在其它东西都失效时才运行，所以它的结构由"此刻还能信什么"决定：不用锁、不用分配器、不用
+日志队列；输出走 `emergency_uart_putc()` 直写 FIFO 寄存器，用有界自旋等"FIFO 满"位。CP 与 AP 不能
+同时 dump——所有权是共享 SRAM 固定区（`FIXED_ADDR_*`，`ram_regions.h` → `CONFIG_PWR_MNG_ADDR+32..52`）
+里的 Peterson 锁加首尾魔数：先到者封区、拿锁、dump、直接重启且不释放；后到者在 `wfe()` 里永久等待。
+区域损坏则 `shared_repair()` 重封；连重封都失败才走兜底（写 `EXCEPTION_DUMPER`，读不回来自己 id 的
+那个永久等待）。六个 `s_cpuN_int_*_en_value` 快照先读各核中断使能寄存器再清零，让 dump 看到故障时刻
+的状态。
+
+关闭的分支全部保留：`CONFIG_MEMDUMP_ALL`（外设与 SRAM 全 dump）、`CONFIG_DEBUG_VERSION` /
+`CONFIG_DUMP_ENABLE`（整个 `rtos_dump_system` 体）、`CONFIG_AP_PSRAM_HEAP_*`、
+`CONFIG_AON_PMU_REG0_REFACTOR_DEV`，以及只在 `CONFIG_SOC_BK7236XX` 下编译的寄存器窗口。
+
+### 两个编译期陷阱
+
+1. **`-fsigned-char`**。权威整棵 Armino 树带这个开关。缺了它，`emergency_uart_write_string()` 里
+   `*string` 从 `ldrsb.w`（带符号加载）变成 `ldrb`——字节 ≥0x80 时进 FIFO 的值不同。
+   `set_source_files_properties()` **不生效**：`arch` 目标是在 `arch/arm/src` 创建的，源文件属性受
+   目录作用域限制。正解是 `set_property(SOURCE … TARGET_DIRECTORY arch PROPERTY COMPILE_OPTIONS
+   "-fsigned-char")`。**规则：移植涉及 `char` 值的 Armino 单元必须带上基线的 `-fsigned-char`。**
+2. **`cm_backtrace.h`** 会拉进 `cmb_def.h` → `FreeRTOS.h`（不该进 chip 层 TU），本文件只用了一个原型，
+   改成按 `cm_backtrace.h:43` 的签名本地声明。
+
+### 验收
+
+| 项 | 结果 |
+| --- | --- |
+| 导出符号 | **22 / 22** |
+| 指令 + 重定位 | **21 / 22 逐条相同** |
+| 唯一差异 | `bk_null_trap_handler` 里 `BK_ASSERT(0)` 的 `__LINE__`（860→912），行号固有 |
+| `trap_base.c.o` 在 map | **0** |
+| 13 个活符号 | 全在；`g_wdt_handler_lr` 与 6 个快照在 `.bss` |
+| `nm -u` | 0 |
+| `.text` | 1,003,348 → 1,003,356 B |
+
+### 上板（探针，镜像 `aa0c6332…`）
+
+探针 `bk7258_drvtest trap` 走完整环路：封区 → 抢 Peterson 锁（内部 `__disable_irq()`）→ 读回所有权
+→ 重新封区 → 恢复中断 → 直写 UART。连跑两次结果相同，证明可重复、不留残留：
+
+```
+trap: lock -> enter=1 ap=0; after repair -> enter=0trap: data_addr_is_valid(sram+0x100,+0x200)=1 data_addr_is_valid(0,32)=0
+trap: int_en snapshots cpu0=00000000/00000000 cpu1=…/… cpu2=…/…
+trap: emergency uart path ok
+trap: done (interrupts restored, shared area re-sealed)
+```
+
+### 探针本身的 bug（已修，值得记）
+
+第一版探针用 `up_irq_save()/up_irq_restore()` 包住 `arch_set_enter_exception()`，结果**整块板子带着
+`PRIMASK=1` 继续跑**，随后 HardFault。原因：**这个 port 的 `up_irq_save/restore` 走 BASEPRI
+（`mrs/mrs BASEPRI`，掩码 0x80），而 `__disable_irq()` 走 PRIMASK**，两套掩码互不相干，restore 归还不了
+PRIMASK。改成 `getprimask()/setprimask()` 后正常。
+
+真实调用者不受影响：`user_except_handler()` 以 `bk_reboot_ex()` 结束、从不返回，所以权威那个
+`__disable_irq()` 不需要归还——**只有"跑完还要继续用板子"的探针才会把它暴露成故障**。教训：
+在这个 port 里混用 `up_irq_save` 与 `__disable_irq` 会漏掉一个掩码。
+
+---
+
+## 批次 13：排除 `at_server`（不是替换，是删除；T17 收尾）
+
+`components/at_server` 整块出局：6 个成员（`_at_server.c` / `at_server.c` / `atsvr_core.c` /
+`atsvr_port.c` / `_atsvr_func.c` / `at_task.c`）、1,697 行、52 个导出符号、39 个镜像内符号。
+
+### 为什么是删而不是移植
+
+和批次 6 的 CLI 同一个理由，而且这次有原文可引：我们的 `compat/bk7258_armino_shell.c` 顶部写着
+"output through up_putc(), **no input** (NuttX's NSH owns the console input)"。`at_server` 的命令设备与
+事件设备就是这个 `shell_uart`，所以**没有 AT 命令会进来，也没有东西能出去**。它的 7.5 KB 代码
+仍在开机时被初始化（`bk_init.c:275/334`），只是空转。
+
+### 需要补的 8 个符号
+
+`compat/bk7258_armino_shell_api.c`（与 CLI 那批同一个文件）：
+
+| 符号 | 我们的实现 |
+| --- | --- |
+| `at_server_init()` / `atsvr_app_init()` | 空 / 返回 `ATSVR_OK` |
+| `atsvr_register_commands(...)` | 返回 `ATSVR_OK`。没有传输层，拒绝注册只会让调用方记录一个它无法处理的失败 |
+| `atsvr_cmd_rsp_ok/error()`、`atsvr_output_msg()`、`atsvr_event_sender()` | 空——没有地方可发 |
+| `_at_svr_env` | **真存储**（全零）。`wifi_at.c` 取它的地址并读字段，全零正是"从未初始化的 at_server"会留下的状态 |
+
+`wifi_at.c` 与 `bk_system_at.c` **保留**：它们是调用方，不是服务端。
+
+### 实测影响
+
+| 指标 | 清理前 | 清理后 | 变化 |
+| --- | --- | --- | --- |
+| `.text` | 1,003,356 B | **997,472 B** | **−5,884 B** |
+| `.data` | 10,080 B | 10,068 B | −12 |
+| `.bss` | 266,624 B | 266,456 B | −168 |
+| `libarmino_at_server` 成员 | 6 | 0 | 全出局 |
+| `nm -u` | 0 | 0 | — |
+
+### T17 状态
+
+`uart_driver`（批次 4）、`stack_base` / `dd` / `driver` / `drv_model` / `arm` / `trap_base`（批次 7–12）、
+`sys_audio_driver`（批次 11）、`sys_touch_driver`（批次 7 前）、`touch_driver_v1_1` 与 `at_server`
+（排除）——**T17 的单元全部收敛完毕**，其中 10 个以"逐字节相同"收尾，2 个以"无传输层、整体删除"收尾。
+
+批次 13 上板（镜像 `309486ca…`）：启动序列与前一批逐行一致（`psram init ok`、`EasyFlash success`、
+`wifi inited(1) ret(0)`、AP `scheduler-running`、`nsh-ap>` 就绪），没有 AT 相关报错。堆起点
+`H28096C30:00008AD0`（较前 +184 B，与 at_server 的 `.bss` −168 B 及对齐相符）。

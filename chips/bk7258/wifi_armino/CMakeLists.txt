@@ -39,7 +39,7 @@ if(CONFIG_BK7258_WIFI_ARMINO_BASELINE)
   # Components left out of phase one, with the evidence required by S2.7:
   # os_source is the FreeRTOS kernel (one scheduler only, NuttX's);
   # lwip_intf_v2_1 is replaced by NuttX's own TCP/IP stack (user decision).
-  set(excluded os_source lwip_intf_v2_1)
+  set(excluded os_source lwip_intf_v2_1 bk_cli at_server)
 
   # lwip's buffer and utility units are gone too. bk_wifi uses them as its
   # packet buffer (pbuf), buffer allocator and address helpers -- none is
@@ -78,8 +78,11 @@ if(CONFIG_BK7258_WIFI_ARMINO_BASELINE)
       cp/components/lwip_intf_v2_1/lwip-2.1.2/src/core/stats.c
       cp/components/bk_rtos/freertos/posix/freertos_impl/source/pthread_local_storage.c
       cp/components/wpa_supplicant-2.10/bk_patch/signal.c
-      # Replaced by compat/bk7258_armino_shell.c: shell_uart.c drove UART0,
-      # which NuttX owns; cli_rpc.c's only used export is cli_debug_cmd_table.
+      # shell_uart.c drove UART0, which NuttX owns.  The shell device driver
+      # that used to stand in for it is gone too: components/bk_cli no longer
+      # builds (it had no input device left), and compat/bk7258_armino_shell_api.c
+      # provides the log/assert entry points the remaining archives call.
+      # cli_rpc.c's only used export was cli_debug_cmd_table.
       cp/components/bk_cli/shell_uart.c
       cp/components/bk_cli/cli_rpc.c
       # Reset belongs to NuttX: the Armino reset entry, and SystemInit which
@@ -126,6 +129,55 @@ if(CONFIG_BK7258_WIFI_ARMINO_BASELINE)
       # same 10 symbols on the authority's uart_ll.h inlines.  uart_driver.c
       # stays for now -- it is the 57-symbol driver face and is the next step.
       cp/middleware/soc/common/hal/uart_hal.c
+      # The driver face above it: chips/bk7258/bk7258_uart_driver.c provides
+      # the same 57 symbols with the same #if gates.  Only seven of them are
+      # live in this image (boot init, two gpio queries, the two PM stubs, the
+      # pm-id mapping and uart_wait_tx_over) -- the rest lost their callers
+      # when the Armino CLI lost its input device and logging moved to syslog.
+      cp/middleware/driver/uart/uart_driver.c
+      # SYS touch face: chips/bk7258/bk7258_sys_touch_driver.c provides the
+      # same 22 register wrappers.  None of them is referenced today.
+      cp/middleware/driver/sys_ctrl/sys_touch_driver.c
+      # The audio half of the same sysctrl face: chips/bk7258/
+      # bk7258_sys_audio_driver.c provides the same 42 wrappers, byte for
+      # byte, including the two that hold the analog resource around the write.
+      cp/middleware/driver/sys_ctrl/sys_audio_driver.c
+      # The stack-reading half of the exception dump: chips/bk7258/
+      # bk7258_stack_base.c provides the same 3 symbols (code_addr_is_valid,
+      # stack_mem_dump, arch_parse_stack_backtrace).  None of them is
+      # referenced today; the writing half stays in trap_base.c.
+      cp/middleware/arch/cm33/stack_base.c
+      # The driver bring-up itself: chips/bk7258/bk7258_driver.c provides
+      # driver_early_init/driver_init with the authority's call list, order and
+      # #if gates.  Both bodies are byte-identical to this unit's, including
+      # the local PSRAM bring-up the baseline already carried here.
+      cp/middleware/driver/common/driver.c
+      # The exception and dump core: chips/bk7258/bk7258_trap_base.c provides
+      # the same 22 symbols -- the Peterson lock in the shared SRAM area, the
+      # per-core interrupt-enable snapshots, the emergency UART writer and the
+      # assert/crash dump paths.  Every body is carried with its #if gates;
+      # it is compiled with the baseline's -fsigned-char so the char handling
+      # matches too.
+      cp/middleware/arch/cm33/trap_base.c
+      # The CM33 core face: chips/bk7258/bk7258_arm.c provides the same 9
+      # symbols (arch_init/smem_reset_lastblock are empty in the authority and
+      # stay empty; the rest is the WFI, NVIC-pending and LDREX/STREX set).
+      cp/middleware/arch/cm33/arm.c
+      # The device model table and its dispatch: chips/bk7258/
+      # bk7258_drv_model.c provides the same 12 symbols.  All twelve bodies
+      # and the DD_MAX_DEV-slot table are byte-identical to this unit's.
+      cp/middleware/driver/common/drv_model.c
+      # The device-driver init table: chips/bk7258/bk7258_dd.c provides
+      # g_dd_init/g_dd_exit.  Its table is empty in this configuration
+      # (CONFIG_SOC_BK7236XX selects the small table, and its only entry needs
+      # CONFIG_FLASH_ORIGIN_API), so both bodies are the authority's empty
+      # walk -- byte for byte.
+      cp/middleware/driver/common/dd.c
+      # The touch controller driver was only kept in the image by cli_pwr.c's
+      # bk_touch_register_touch_isr() call.  With components/bk_cli gone that
+      # reference is gone too, so the whole unit drops out without a port:
+      # this board never drives the panel path.
+      cp/middleware/driver/touch/touch_driver_v1_1.c
       # The log transport: chips/bk7258/bk7258_printf.c provides the same 26
       # symbols (printf 20 + printf_base 6) with the provider's format and
       # filters, but hands every line to syslog instead of the UART driver.
@@ -165,11 +217,11 @@ if(CONFIG_BK7258_WIFI_ARMINO_BASELINE)
       cp/components/temp_detect/bk_sensor.c
       cp/components/temp_detect/volt_detect.c)
 
-  # NuttX's config.h defines CONFIG_SPI=1 and reaches Armino units through
-  # the libc headers; the baseline sdkconfig leaves it undefined, so
-  # driver.c:356 would call bk_spi_driver_init(), which the baseline never
-  # does. None of the NuttX headers in driver.c's include closure tests it.
-  set(nuttx_config_compat_components driver)
+  # driver.c is excluded (chips/bk7258/bk7258_driver.c is its port), so the
+  # CONFIG_SPI collision it needed this list for is handled inside that file
+  # instead: NuttX's config.h defines CONFIG_SPI for its own SPI layer, while
+  # the Armino name means "the Armino SPI driver is built", which it is not.
+  set(nuttx_config_compat_components "")
 
   # bk_patch holds wpa's own headers plus a bare-metal signal.h that shadows
   # NuttX's <signal.h>. Replace its -I with: generated forwarders for the
@@ -376,6 +428,7 @@ if(CONFIG_BK7258_WIFI_ARMINO_BASELINE)
 
   target_sources(arch PRIVATE bk7258_armino_start.c
                  compat/bk7258_armino_shell.c compat/bk7258_armino_irq.c
+                 compat/bk7258_armino_shell_api.c
                  compat/bk7258_freertos_nuttx.c compat/bk7258_lwip_sys.c
                  compat/bk7258_armino_netdev.c
                  compat/bk7258_armino_wops.c)
